@@ -361,7 +361,6 @@ def _make_sample_runner(
             vocab_size,
             max_num_reqs,
             async_scheduling=async_scheduling,
-            speculative_decoding=spec_k is not None,
         ),
         _greedy_head_owner=object() if top_tokens else None,
         speculative_config=spec_cfg,

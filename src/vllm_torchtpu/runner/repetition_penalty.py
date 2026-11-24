@@ -36,6 +36,11 @@ and picks the token from ``float32``. Here the scaled logits go back to
 precompiled graphs take, so they are rounded a second time. Two logits closer
 than one ``bfloat16`` step (0.125 near 20) can then tie or swap, and the
 greedy token can differ from vLLM's.
+
+A speculative verify chunk has one logits row for each draft position of a
+request and one bonus row. As in vLLM (``_combine_outputs_with_spec_tokens`` of
+``RejectionSampler`` and ``Sampler``), the row at draft position ``p`` sees the
+request's tokens plus ``drafts[:p]``, and the bonus row sees all the drafts.
 """
 
 from __future__ import annotations
@@ -49,6 +54,7 @@ from vllm.utils.math_utils import cdiv
 
 from vllm_torchtpu.layers.adapter.sample import repetition_penalty as penalty_op
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import min_tokens
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -111,7 +117,8 @@ class SeenTokenBitmask:
 class RepetitionPenaltyTracker:
     """Seen-token bitmasks, by request id, of the requests that
     ``InputBatch.repetition_penalties_reqs`` lists, and the host staging
-    buffers for one logits chunk of at most ``max_num_reqs`` rows."""
+    buffers for one logits tensor. The buffers start at ``max_num_reqs`` rows
+    and grow to the largest verify bucket when ``warmup`` stages it."""
 
     def __init__(
         self,
@@ -119,14 +126,11 @@ class RepetitionPenaltyTracker:
         max_num_reqs: int,
         *,
         async_scheduling: bool,
-        speculative_decoding: bool,
     ) -> None:
         self.vocab_size = vocab_size
         # TODO(#2861): apply under async_scheduling. There the previous step's
         # sampled token is still on the device when the bitmask is built.
-        # TODO(#2862): apply in speculative decoding. There each verify row
-        # needs the bitmask plus its draft prefix.
-        self.supported = not async_scheduling and not speculative_decoding
+        self.supported = not async_scheduling
         self._seen: dict[str, SeenTokenBitmask] = {}
         self._bitmask_buf = np.zeros(
             (max_num_reqs, cdiv(vocab_size, 32)), dtype=np.int32
@@ -149,9 +153,8 @@ class RepetitionPenaltyTracker:
         if not self.supported:
             logger.warning_once(
                 "repetition_penalty is not yet applied on TPU with "
-                "async_scheduling or speculative decoding; requests run without "
-                "it. Run with async_scheduling=False and no speculative_config "
-                "to apply it."
+                "async_scheduling; requests run without it. Run with "
+                "async_scheduling=False to apply it."
             )
             return False
         self._prune(penalized)
@@ -173,20 +176,81 @@ class RepetitionPenaltyTracker:
             return logits
         return apply_penalties_table(logits, *inputs)
 
+    def apply_verify_logits(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        requests: Mapping[str, Any],
+        start: int,
+        drafts: Sequence[Sequence[int]],
+    ) -> torch.Tensor:
+        """Scale a verify chunk's logits before the target / bonus gathers.
+
+        Request ``start + k`` has drafts ``drafts[k]`` and owns
+        ``len(drafts[k]) + 1`` consecutive rows: its draft positions, then its
+        bonus.
+        """
+        rows = min_tokens.verify_logits_rows(
+            self._penalized_indices(input_batch), start, [len(d) for d in drafts]
+        )
+        return self._apply_rows(logits, input_batch, requests, rows, start, drafts)
+
+    def apply_verify_split(
+        self,
+        target_logits: torch.Tensor,
+        bonus_logits: torch.Tensor,
+        input_batch: InputBatch,
+        requests: Mapping[str, Any],
+        start: int,
+        drafts: Sequence[Sequence[int]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scale a verify chunk's target and bonus logits after the gathers.
+
+        Request ``start + k`` owns ``len(drafts[k])`` consecutive target rows
+        and bonus row ``k``.
+        """
+        target_rows, bonus_rows = min_tokens.verify_rows(
+            self._penalized_indices(input_batch), start, [len(d) for d in drafts]
+        )
+        # The staging buffers are free again when a call returns: the upload
+        # in apply_penalties_table is blocking.
+        target_logits = self._apply_rows(
+            target_logits, input_batch, requests, target_rows, start, drafts
+        )
+        bonus_logits = self._apply_rows(
+            bonus_logits, input_batch, requests, bonus_rows, start, drafts
+        )
+        return target_logits, bonus_logits
+
     def warmup(self, logits: torch.Tensor) -> torch.Tensor:
         """Run the kernel on ``logits`` with the staging buffers, as ``apply``
-        does for a chunk of ``logits.shape[0]`` rows. The runner's precompile
-        calls this, so warmup and serving stage their inputs in one way."""
-        num_rows = logits.shape[0]
-        return apply_penalties_table(
-            logits, self._bitmask_buf[:num_rows], self._penalties_buf[:num_rows]
-        )
+        and the verify calls do for a tensor of ``logits.shape[0]`` rows. The
+        runner's precompile calls this, so warmup and serving stage their
+        inputs in one way."""
+        return apply_penalties_table(logits, *self._buffers(logits.shape[0]))
 
     def _prune(self, req_ids: Collection[str]) -> None:
         """Drop the bitmasks of requests that are not in ``req_ids``."""
         if len(self._seen) > len(req_ids):
             for req_id in [r for r in self._seen if r not in req_ids]:
                 del self._seen[req_id]
+
+    def _penalized_indices(self, input_batch: InputBatch) -> list[int]:
+        """Batch indices of the requests that have a penalty."""
+        req_id_to_index = input_batch.req_id_to_index
+        return [
+            req_id_to_index[req_id] for req_id in input_batch.repetition_penalties_reqs
+        ]
+
+    def _buffers(self, num_rows: int) -> tuple[np.ndarray, np.ndarray]:
+        """The first ``num_rows`` rows of the staging buffers."""
+        if num_rows > self._bitmask_buf.shape[0]:
+            self._bitmask_buf = np.zeros(
+                (num_rows, self._bitmask_buf.shape[1]), dtype=np.int32
+            )
+            self._penalties_buf = np.ones((num_rows, 1), dtype=np.float32)
+            self._dirty_rows.clear()
+        return self._bitmask_buf[:num_rows], self._penalties_buf[:num_rows]
 
     def build_plain_inputs(
         self,
@@ -199,35 +263,71 @@ class RepetitionPenaltyTracker:
         """Stage ``(seen_bitmask, penalties)`` for the plain 1-row/req logits
         chunk of batch rows ``[start, end)`` into reusable host buffers, or
         return ``None`` when no row in the chunk has a penalty."""
-        req_id_to_index = input_batch.req_id_to_index
-        indices = [
-            index
-            for req_id in input_batch.repetition_penalties_reqs
-            if start <= (index := req_id_to_index[req_id]) < end
-        ]
-        if not indices:
+        rows = min_tokens.plain_rows(self._penalized_indices(input_batch), start, end)
+        return self.build_inputs(input_batch, requests, rows, num_rows)
+
+    def build_inputs(
+        self,
+        input_batch: InputBatch,
+        requests: Mapping[str, Any],
+        rows: min_tokens.StateRows,
+        num_rows: int,
+        start: int = 0,
+        drafts: Sequence[Sequence[int]] = (),
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Stage ``(seen_bitmask, penalties)`` for a logits tensor of
+        ``num_rows`` rows into reusable host buffers, or return ``None`` when
+        ``rows`` is empty.
+
+        ``rows`` maps the batch index of a penalized request to ``(first row,
+        drafts before that row, number of rows)``, as ``min_tokens.StateRows``.
+        Row ``first + j`` sees the request's prompt and output ids plus the
+        first ``ahead + j`` ids of ``drafts[batch index - start]``.
+        """
+        if not rows:
             return None
+        bitmask_buf, penalties_buf = self._buffers(num_rows)
         for prev_row in self._dirty_rows:
             self._bitmask_buf[prev_row].fill(0)
             self._penalties_buf[prev_row, 0] = 1.0
         self._dirty_rows.clear()
 
-        for batch_idx in indices:
-            row = batch_idx - start
+        vocab_size = self.vocab_size
+        for batch_idx, (first, ahead, count) in rows.items():
             req_id = input_batch.req_ids[batch_idx]
-            seen = self._seen.get(req_id)
-            if seen is None:
-                seen = self._seen[req_id] = SeenTokenBitmask(self.vocab_size)
             output_ids = input_batch.req_output_token_ids[batch_idx]
             assert req_id is not None and output_ids is not None
-            self._bitmask_buf[row] = seen.update(
-                requests[req_id].prompt_token_ids, output_ids
-            )
-            self._penalties_buf[row, 0] = input_batch.repetition_penalties_cpu[
-                batch_idx
-            ]
-            self._dirty_rows.append(row)
-        return self._bitmask_buf[:num_rows], self._penalties_buf[:num_rows]
+            seen = self._seen.get(req_id)
+            if seen is None:
+                seen = self._seen[req_id] = SeenTokenBitmask(vocab_size)
+            base = seen.update(requests[req_id].prompt_token_ids, output_ids)
+            penalty = input_batch.repetition_penalties_cpu[batch_idx]
+            for j in range(count):
+                row = first + j
+                bitmask = bitmask_buf[row]
+                bitmask[:] = base
+                for tok in drafts[batch_idx - start][: ahead + j] if drafts else ():
+                    if 0 <= tok < vocab_size:
+                        bitmask[tok >> 5] |= _BIT_MASKS[tok & 31]
+                penalties_buf[row, 0] = penalty
+                self._dirty_rows.append(row)
+        return bitmask_buf, penalties_buf
+
+    def _apply_rows(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        requests: Mapping[str, Any],
+        rows: min_tokens.StateRows,
+        start: int,
+        drafts: Sequence[Sequence[int]],
+    ) -> torch.Tensor:
+        inputs = self.build_inputs(
+            input_batch, requests, rows, logits.shape[0], start, drafts
+        )
+        if inputs is None:
+            return logits
+        return apply_penalties_table(logits, *inputs)
 
 
 def apply_penalties_table(

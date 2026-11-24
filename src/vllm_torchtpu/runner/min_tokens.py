@@ -175,17 +175,19 @@ def build_stop_table(
     return stop_ids, restore
 
 
-def _in_chunk(state: MinTokensState, start: int, end: int) -> list[int]:
+def _in_chunk(state: Iterable[int], start: int, end: int) -> list[int]:
     return [i for i in state if start <= i < end]
 
 
-def plain_rows(state: MinTokensState, start: int, end: int) -> StateRows:
-    """Rows of a chunk with one logits row per request."""
+def plain_rows(state: Iterable[int], start: int, end: int) -> StateRows:
+    """Rows of a chunk with one logits row per request. ``state`` gives the
+    batch indices to keep (a ``MinTokensState``, or any batch indices: the
+    repetition penalty uses these row helpers too)."""
     return {i: (i - start, 0, 1) for i in _in_chunk(state, start, end)}
 
 
 def verify_rows(
-    state: MinTokensState, start: int, draft_lengths: Sequence[int]
+    state: Iterable[int], start: int, draft_lengths: Sequence[int]
 ) -> tuple[StateRows, StateRows]:
     """(target rows, bonus rows) of a verify chunk: request ``start + k`` owns
     ``draft_lengths[k]`` consecutive target rows and bonus row ``k``."""
@@ -201,7 +203,7 @@ def verify_rows(
 
 
 def verify_logits_rows(
-    state: MinTokensState, start: int, draft_lengths: Sequence[int]
+    state: Iterable[int], start: int, draft_lengths: Sequence[int]
 ) -> StateRows:
     """Rows of a verify chunk's logits, before the target / bonus gathers:
     request ``start + k`` owns ``draft_lengths[k] + 1`` consecutive rows, its

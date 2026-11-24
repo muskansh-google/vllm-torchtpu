@@ -23,6 +23,7 @@ from vllm import SamplingParams
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.runner.repetition_penalty import RepetitionPenaltyTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 NEG_INF = float("-inf")
@@ -254,6 +255,65 @@ def test_spec_verify_chunk_applies_grammar_then_min_tokens(all_greedy: bool) -> 
 
     assert out[0].tolist() == [30, 31, 33]
     assert seen_by_grammar == [6.5]
+
+
+@pytest.mark.parametrize("grammar", [False, True], ids=["no_grammar", "grammar"])
+@pytest.mark.parametrize("all_greedy", [True, False], ids=["greedy", "random"])
+@pytest.mark.parametrize("rep_pen", [True, False], ids=["penalized", "control"])
+def test_spec_verify_chunk_penalizes_each_row_with_the_drafts_before_it(
+    rep_pen: bool, all_greedy: bool, grammar: bool
+) -> None:
+    """Drafts [30, 31], prompt [50], ``repetition_penalty`` 100. Each row
+    prefers one token (20.0) far above its runner-up (10.0):
+
+    - draft row 0: its own draft 30, then 40. Draft 30 is not seen there.
+    - draft row 1: token 30, the draft before it, then its own draft 31.
+    - bonus row: draft 31, then 32.
+
+    The penalty takes a seen 20.0 to 0.2, so draft 31 is accepted and the
+    bonus is 32. The control rejects draft 31 for token 30.
+    """
+    runner = _runner(all_greedy=all_greedy, spec_k=2)
+    runner._repetition_penalty = RepetitionPenaltyTracker(
+        128, 4, async_scheduling=False
+    )
+    runner.requests = {"r0": SimpleNamespace(prompt_token_ids=[50])}
+    batch = runner.input_batch
+    batch.req_id_to_index = {"r0": 0}
+    batch.repetition_penalties_reqs = {"r0"}
+    batch.repetition_penalties_cpu = np.array([100.0], dtype=np.float32)
+    batch.req_output_token_ids = [[]]
+    fused = MagicMock(side_effect=runner.spec_bonus_and_target_logits)
+    runner.spec_bonus_and_target_logits = fused
+    runner.structured_decoding_manager = SimpleNamespace(
+        mask_spec_logits=lambda target, bonus, *_args: (target, bonus),
+        mask_invalid_draft_tokens=lambda draft_token_ids, *_args, **_kwargs: (
+            draft_token_ids
+        ),
+    )
+    logits = torch.full((4, 128), -20.0)
+    logits[0, 30], logits[0, 40] = 20.0, 10.0
+    logits[1, 30], logits[1, 31] = 20.0, 10.0
+    logits[2, 31], logits[2, 32] = 20.0, 10.0
+
+    out = runner._sample_spec_verify_chunk(
+        logits,
+        _verify_md([30, 31]),
+        object() if grammar else None,
+        SimpleNamespace(scheduled_spec_decode_tokens={"r0": [30, 31]}),
+        0,
+        1,
+        all_greedy,
+        torch.Generator().manual_seed(0),
+        False,
+        {},
+        rep_pen=rep_pen,
+    )
+
+    assert out[0].tolist() == ([30, 31, 32] if rep_pen else [30, 30, -1])
+    # A greedy chunk without a grammar keeps the fused verify prelude: the
+    # penalty runs on the logits before the gathers.
+    assert fused.called is (all_greedy and not grammar)
 
 
 # Per-chunk processor hooks (``chunk_processors``).

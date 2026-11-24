@@ -22,6 +22,7 @@ import numpy as np
 import torch
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
@@ -143,7 +144,6 @@ def plain_step_runner(logits: torch.Tensor) -> SimpleNamespace:
             logits.shape[1],
             max(8, logits.shape[0]),
             async_scheduling=False,
-            speculative_decoding=False,
         ),
     )
     request = runner.requests["r0"]
@@ -160,6 +160,26 @@ def plain_step_runner(logits: torch.Tensor) -> SimpleNamespace:
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     return runner
+
+
+def use_real_spec_verify(runner, num_speculative_tokens: int) -> None:
+    """Give `runner` an ngram speculative config of `num_speculative_tokens`
+    drafts, the strict `RejectionSampler` and the runner's own verify-chunk
+    methods, so a step with spec-decode metadata verifies its drafts."""
+    spec_config = SimpleNamespace(
+        method="ngram",
+        num_speculative_tokens=num_speculative_tokens,
+        rejection_sample_method="strict",
+        synthetic_acceptance_rates=None,
+    )
+    runner.speculative_config = spec_config
+    runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
+    for name in (
+        "_sample_spec_verify_chunk",
+        "spec_bonus_and_target_logits",
+        "spec_gather_bonus_and_target_logits",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
 
 def run_sample_tokens(runner):

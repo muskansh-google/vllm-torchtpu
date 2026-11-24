@@ -24,6 +24,7 @@ from runner_output_test_utils import (
     _host_copy_state,
     plain_step_runner,
     run_sample_tokens,
+    use_real_spec_verify,
 )
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
@@ -750,20 +751,7 @@ def _spec_step_runner(num_output, logits_list, md_list, req_ids):
         runner.requests.setdefault(
             r, SimpleNamespace(num_computed_tokens=0, num_tokens=1, output_token_ids=[])
         )
-    spec_config = SimpleNamespace(
-        method="ngram",
-        num_speculative_tokens=3,
-        rejection_sample_method="strict",
-        synthetic_acceptance_rates=None,
-    )
-    runner.speculative_config = spec_config
-    runner.rejection_sampler = RejectionSampler(spec_config, torch.device("cpu"))
-    for name in (
-        "_sample_spec_verify_chunk",
-        "spec_bonus_and_target_logits",
-        "spec_gather_bonus_and_target_logits",
-    ):
-        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    use_real_spec_verify(runner, num_speculative_tokens=3)
     return runner
 
 

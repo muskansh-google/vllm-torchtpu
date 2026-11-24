@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """``repetition_penalty`` on the TPU sampler: request tracking, packed bitmask
-scaling math, sync decode integration, and TPU compilation."""
+scaling math, sync decode and speculative verify integration, and TPU
+compilation."""
 
 from __future__ import annotations
 
@@ -22,7 +23,11 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from runner_output_test_utils import plain_step_runner, run_sample_tokens
+from runner_output_test_utils import (
+    plain_step_runner,
+    run_sample_tokens,
+    use_real_spec_verify,
+)
 from vllm import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
@@ -71,19 +76,32 @@ def _batch(rows: dict[str, tuple[float, list[int]]], order: list[str]):
     )
 
 
-def _tracker_in_mode(vocab_size: int, async_scheduling: bool, spec):
+def _tracker(vocab_size: int, max_num_reqs: int = 8, async_scheduling: bool = False):
     return rep_pen.RepetitionPenaltyTracker(
-        vocab_size,
-        8,
-        async_scheduling=async_scheduling,
-        speculative_decoding=spec is not None,
+        vocab_size, max_num_reqs, async_scheduling=async_scheduling
     )
 
 
-def _tracker(vocab_size: int, max_num_reqs: int = 8):
-    return rep_pen.RepetitionPenaltyTracker(
-        vocab_size, max_num_reqs, async_scheduling=False, speculative_decoding=False
+def _precompile_runner(tracker, speculative: bool):
+    """The runner state `_precompile_repetition_penalty` reads: request
+    buckets 8 and 16, and with `speculative` the verify row buckets 16, 32 and
+    64 (`num_tokens_paddings` up to the 64 target rows of the grammar
+    bitmask)."""
+    runner = object.__new__(TPUModelRunner)
+    runner.num_reqs_paddings = [8, 16]
+    runner.num_tokens_paddings = [16, 32, 64, 128]
+    runner.speculative_config = object() if speculative else None
+    runner._mtp_prefill_only = False
+    runner.structured_decoding_manager = SimpleNamespace(
+        target_grammar_bitmask_cpu=torch.zeros(64, 1)
     )
+    runner._repetition_penalty = tracker
+    runner.device = torch.device("cpu")
+    runner._dummy_logits = lambda n: torch.zeros(
+        n, tracker.vocab_size, dtype=torch.bfloat16
+    )
+    runner._precompile_timed = MagicMock()
+    return runner
 
 
 class TestSeenTokenBitmask:
@@ -188,6 +206,98 @@ class TestTracker:
         assert torch.equal(first, logits)
         assert torch.equal(second[0], logits[0])
         assert second[1].tolist() == [4.0, 2.0, 4.0, 4.0, 4.0, 2.0, 4.0, 4.0]
+
+    def test_verify_logits_rows_see_the_drafts_before_them(self):
+        """Verify chunk [1, 3) before the gathers: "a" (batch index 1, no
+        penalty) owns rows 0-1, "b" (batch index 2, drafts [2, 3, 99]) owns rows
+        2-5: draft position p sees prompt + output + drafts[:p], the bonus row
+        all the in-range drafts."""
+        tracker = _tracker(vocab_size=64)
+        order = ["x", "a", "b"]
+        rows = {"x": (1.0, []), "a": (1.0, []), "b": (1.5, [7])}
+        requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in order}
+        seen: list[list[int]] = []
+        penalties: list[float] = []
+
+        def record(logits, bitmask, pens):
+            seen.extend(_unpack_bits(row, 64) for row in bitmask)
+            penalties.extend(pens[:, 0].tolist())
+            return logits
+
+        with patch.object(rep_pen, "apply_penalties_table", side_effect=record):
+            tracker.apply_verify_logits(
+                torch.zeros(8, 64), _batch(rows, order), requests, 1, [[9], [2, 3, 99]]
+            )
+        assert seen == [
+            [],
+            [],
+            [1, 7],
+            [1, 2, 7],
+            [1, 2, 3, 7],
+            [1, 2, 3, 7],
+            [],
+            [],
+        ]
+        assert penalties == pytest.approx([1.0, 1.0, 1.5, 1.5, 1.5, 1.5, 1.0, 1.0])
+
+    def test_verify_split_rows_follow_the_target_and_bonus_gathers(self):
+        """After the gathers, "a" (no penalty, 1 draft) owns target row 0 and
+        bonus row 0; "b" (drafts [2, 3]) owns target rows 1-2 and bonus row 1.
+        The bonus call reuses the buffers: target row 2 must be cleared."""
+        tracker = _tracker(vocab_size=64)
+        order = ["a", "b"]
+        rows = {"a": (1.0, []), "b": (1.5, [7])}
+        requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in order}
+        staged: list[list[list[int]]] = []
+
+        def record(logits, bitmask, _pens):
+            staged.append([_unpack_bits(row, 64) for row in bitmask])
+            return logits
+
+        with patch.object(rep_pen, "apply_penalties_table", side_effect=record):
+            tracker.apply_verify_split(
+                torch.zeros(4, 64),
+                torch.zeros(4, 64),
+                _batch(rows, order),
+                requests,
+                0,
+                [[9], [2, 3]],
+            )
+        target, bonus = staged
+        assert target == [[], [1, 7], [1, 2, 7], []]
+        assert bonus == [[], [1, 2, 3, 7], [], []]
+
+    def test_verify_chunk_without_a_penalized_request_stages_nothing(self):
+        tracker = _tracker(vocab_size=64)
+        rows = {"a": (1.0, []), "b": (1.5, [])}
+        requests = {r: SimpleNamespace(prompt_token_ids=[1]) for r in "ab"}
+        logits = torch.zeros(4, 64)
+        with patch.object(rep_pen, "apply_penalties_table") as apply:
+            # Only "a" (batch index 0) is in the chunk [0, 1).
+            out = tracker.apply_verify_logits(
+                logits, _batch(rows, ["a", "b"]), requests, 0, [[5]]
+            )
+        assert out is logits
+        apply.assert_not_called()
+
+    def test_staging_buffers_grow_to_a_larger_row_bucket(self):
+        """A verify bucket has more rows than `max_num_reqs`; the grown buffers
+        are reused by the smaller buckets."""
+        tracker = _tracker(vocab_size=64, max_num_reqs=2)
+        requests = {"a": SimpleNamespace(prompt_token_ids=[1])}
+        batch = _batch({"a": (1.5, [])}, ["a"])
+        rows = min_tokens.verify_logits_rows([0], 0, [3])
+        inputs = tracker.build_inputs(batch, requests, rows, 8, drafts=[[2, 3, 4]])
+        assert inputs is not None
+        bitmask, penalties = inputs
+        assert bitmask.shape == (8, 2) and penalties.shape == (8, 1)
+        assert _unpack_bits(bitmask[3], 64) == [1, 2, 3, 4]
+        plain = tracker.build_plain_inputs(batch, requests, 0, 1, num_rows=2)
+        assert plain is not None
+        assert np.shares_memory(plain[0], bitmask)
+        # Rows 1-3 of the verify call are cleared.
+        assert not bitmask[1:].any()
+        assert penalties[:, 0].tolist() == pytest.approx([1.5] + [1.0] * 7)
 
     def test_prune_drops_requests_that_left_the_penalized_set(self):
         tracker = _tracker(vocab_size=8)
@@ -419,12 +529,7 @@ class TestRunnerIntegration:
         runner.speculative_config = None
         runner._greedy_head_owner = object()
         runner._min_tokens = min_tokens.MinTokensTracker()
-        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
-            vocab_size=16,
-            max_num_reqs=4,
-            async_scheduling=False,
-            speculative_decoding=False,
-        )
+        runner._repetition_penalty = _tracker(vocab_size=16, max_num_reqs=4)
 
         assert batch.repetition_penalties_reqs == {"a"}
         assert not runner._greedy_top_tokens_this_step()
@@ -437,14 +542,39 @@ class TestRunnerIntegration:
         assert out[1, 5].item() == pytest.approx(1.0)
         assert out[1, 0].item() == pytest.approx(2.0)
 
-    @pytest.mark.parametrize(
-        ("async_scheduling", "spec"), [(True, None), (False, object())]
-    )
-    def test_unsupported_modes_skip_penalty_with_warning(self, async_scheduling, spec):
-        """An unsupported mode logs warning_once, applies nothing and keeps the
+    def test_spec_step_penalizes_verify_rows_through_sample_tokens(self):
+        """Drafts [5, 6], penalty 2.0. Draft row 1 prefers token 5 (4.0), the
+        draft before it, over its own draft 6 (3.0); the bonus row prefers
+        draft 6 (4.0) over token 7 (3.0). With the penalty, 5 and 6 drop to
+        2.0 there, so both drafts are accepted and the bonus is 7. Without it
+        the step returns [5, 5]."""
+        logits = torch.zeros(3, 8)
+        logits[0, 5] = 4.0
+        logits[1, 5], logits[1, 6] = 4.0, 3.0
+        logits[2, 6], logits[2, 7] = 4.0, 3.0
+        runner = _penalized_runner(logits, penalty=2.0)
+        use_real_spec_verify(runner, num_speculative_tokens=2)
+        st = runner.execute_model_state
+        st.scheduler_output.scheduled_spec_decode_tokens = {"r0": [5, 6]}
+        st.spec_decode_metadata_list = [
+            SimpleNamespace(
+                draft_token_ids=torch.tensor([5, 6], dtype=torch.int32),
+                draft_lengths=torch.tensor([2], dtype=torch.int32),
+                draft_lengths_cpu=np.array([2]),
+                target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+                bonus_logits_indices=torch.tensor([2], dtype=torch.int32),
+                final_logits_indices=torch.arange(3, dtype=torch.int32),
+                segment_ids=torch.tensor([0, 0], dtype=torch.int64),
+                group_indices=torch.tensor([0, 1], dtype=torch.int32),
+            )
+        ]
+        assert run_sample_tokens(runner).sampled_token_ids == [[5, 6, 7]]
+
+    def test_async_scheduling_skips_penalty_with_warning(self):
+        """Async scheduling logs warning_once, applies nothing and keeps the
         greedy top-tokens fast path open."""
         runner = _penalized_runner(torch.zeros(1, 8))
-        runner._repetition_penalty = _tracker_in_mode(8, async_scheduling, spec)
+        runner._repetition_penalty = _tracker(8, async_scheduling=True)
         with patch.object(rep_pen, "logger") as log:
             assert not runner._repetition_penalty.begin_step(runner.input_batch)
         log.warning_once.assert_called_once()
@@ -455,31 +585,21 @@ class TestRunnerIntegration:
             assert TPUModelRunner._greedy_top_tokens_this_step(runner)
 
     @pytest.mark.parametrize(
-        ("async_scheduling", "spec", "expected"),
+        ("async_scheduling", "speculative", "expected_rows"),
         [
-            (
-                False,
-                None,
-                [(8, 12, torch.bfloat16, (8, 1)), (16, 12, torch.bfloat16, (16, 1))],
-            ),
-            (True, None, []),
-            (False, object(), []),
+            (False, False, [8, 16]),
+            # The verify row buckets too; they are larger than max_num_reqs.
+            (False, True, [8, 16, 32, 64]),
+            (True, False, []),
         ],
     )
     def test_precompile_covers_supported_buckets_only(
-        self, async_scheduling, spec, expected
+        self, async_scheduling, speculative, expected_rows
     ):
-        runner = object.__new__(TPUModelRunner)
-        runner.num_reqs_paddings = [8, 16]
-        runner._repetition_penalty = rep_pen.RepetitionPenaltyTracker(
-            vocab_size=12,
-            max_num_reqs=16,
-            async_scheduling=async_scheduling,
-            speculative_decoding=spec is not None,
+        runner = _precompile_runner(
+            _tracker(12, max_num_reqs=16, async_scheduling=async_scheduling),
+            speculative,
         )
-        runner.device = torch.device("cpu")
-        runner._dummy_logits = lambda n: torch.zeros(n, 12, dtype=torch.bfloat16)
-        runner._precompile_timed = MagicMock()
         apply_calls: list[tuple[int, int, torch.dtype, tuple[int, int]]] = []
         orig_apply = penalty_op.apply_repetition_penalty
 
@@ -500,22 +620,20 @@ class TestRunnerIntegration:
         ):
             runner._precompile_repetition_penalty()
 
-        assert apply_calls == expected
+        assert apply_calls == [
+            (rows, 12, torch.bfloat16, (rows, 1)) for rows in expected_rows
+        ]
 
 
 @pytest.mark.usefixtures("eager")
 def test_precompile_covers_the_calls_serving_makes():
-    """At every request bucket, the kernel call of a step with a penalized
-    row has the shapes and dtypes of a precompiled call (logits, bitmask and
-    penalties). Both sides take their logits from `_dummy_logits` and stage
-    the tracker's buffers through `apply_penalties_table`."""
-    buckets = [8, 16]
-    runner = object.__new__(TPUModelRunner)
-    runner.num_reqs_paddings = buckets
-    runner._repetition_penalty = _tracker(vocab_size=40, max_num_reqs=16)
-    runner.device = torch.device("cpu")
-    runner._dummy_logits = lambda n: torch.zeros(n, 40, dtype=torch.bfloat16)
-    runner._precompile_timed = MagicMock()
+    """At every row bucket (request and verify buckets alike), the kernel
+    calls of a step with a penalized row have the shapes and dtypes of a
+    precompiled call (logits, bitmask and penalties). Both sides take their
+    logits from `_dummy_logits` and stage the tracker's buffers through
+    `apply_penalties_table`."""
+    tracker = _tracker(vocab_size=40, max_num_reqs=16)
+    runner = _precompile_runner(tracker, speculative=True)
     calls = set()
     orig_apply = penalty_op.apply_repetition_penalty
 
@@ -535,16 +653,23 @@ def test_precompile_covers_the_calls_serving_makes():
     with patch.object(penalty_op, "apply_repetition_penalty", side_effect=spy_apply):
         runner._precompile_repetition_penalty()
         precompiled, calls = calls, set()
-        rows = {"r0": (1.3, [7])}
-        for num_rows in buckets:
-            runner._repetition_penalty.apply(
-                runner._dummy_logits(num_rows),
-                _batch(rows, ["r0"]),
-                {"r0": SimpleNamespace(prompt_token_ids=[33])},
-                0,
-                1,
+        batch = _batch({"r0": (1.3, [7])}, ["r0"])
+        requests = {"r0": SimpleNamespace(prompt_token_ids=[33])}
+        for num_rows in runner.num_reqs_paddings:
+            tracker.apply(runner._dummy_logits(num_rows), batch, requests, 0, 1)
+        for num_rows in runner._verify_logits_paddings():
+            tracker.apply_verify_logits(
+                runner._dummy_logits(num_rows), batch, requests, 0, [[5, 6]]
             )
-    assert len(calls) == len(buckets)
+            tracker.apply_verify_split(
+                runner._dummy_logits(num_rows),
+                runner._dummy_logits(runner.num_reqs_paddings[0]),
+                batch,
+                requests,
+                0,
+                [[5, 6]],
+            )
+    assert len(calls) == 4  # buckets 8, 16, 32 and 64
     assert calls <= precompiled
 
 

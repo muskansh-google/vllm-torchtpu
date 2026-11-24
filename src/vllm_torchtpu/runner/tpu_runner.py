@@ -1165,7 +1165,6 @@ class TPUModelRunner(GPUModelRunner):
             self.vocab_size,
             self.max_num_reqs,
             async_scheduling=bool(self.scheduler_config.async_scheduling),
-            speculative_decoding=self.speculative_config is not None,
         )
         # 1 on TP rank 0, else 0; built lazily on first use by
         # _sync_replicated_drafts_across_tp (needs the TP group initialized).
@@ -5468,12 +5467,15 @@ class TPUModelRunner(GPUModelRunner):
         top_tokens: bool = False,
         min_toks: min_tokens_mask.MinTokensState | None = None,
         processors: Sequence[chunk_processors.SpecChunkProcessor] = (),
+        rep_pen: bool = False,
     ) -> torch.Tensor:
         """Bonus-token sampling + draft rejection for one spec-verify chunk.
 
         Returns the rejection sampler's [num_reqs, 1 + num_spec_tokens]
         selected tokens for the chunk. With ``top_tokens``, ``logits`` holds
-        each row's greedy token instead (no request is below min_tokens then).
+        each row's greedy token instead (no request is below min_tokens or
+        penalized then).
+        ``rep_pen`` is ``RepetitionPenaltyTracker.begin_step`` for this step.
         ``processors`` prepare the target and bonus rows and the drafts before
         the rejection sampler runs, then ``finish`` on its output
         (``chunk_processors.SpecChunkProcessor``).
@@ -5520,6 +5522,28 @@ class TPUModelRunner(GPUModelRunner):
                     min_tokens_rows = min_tokens_mask.verify_rows(
                         min_toks, cur_start_idx, draft_lengths.tolist()
                     )
+            rep_pen_drafts: list[Sequence[int]] | None = None
+            if rep_pen:
+                # Sync scheduling: the scheduler's drafts are the ones this
+                # chunk verifies.
+                spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+                rep_pen_drafts = [
+                    spec_tokens.get(cast(str, req_id), ())
+                    for req_id in self.input_batch.req_ids[cur_start_idx:cur_end_idx]
+                ]
+                assert [len(d) for d in rep_pen_drafts] == md.draft_lengths_cpu[
+                    : cur_end_idx - cur_start_idx
+                ].tolist(), "scheduled drafts do not match the verify rows"
+                if grammar_output is None:
+                    # Before the gathers, as the min_tokens mask above.
+                    logits = self._repetition_penalty.apply_verify_logits(
+                        logits,
+                        self.input_batch,
+                        self.requests,
+                        cur_start_idx,
+                        rep_pen_drafts,
+                    )
+                    rep_pen_drafts = None
             if all_greedy and grammar_output is None and not processors:
                 bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                     logits, md.bonus_logits_indices, md.target_logits_indices
@@ -5557,6 +5581,18 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     bonus_logits = self._mask_min_tokens(
                         bonus_logits, bonus_rows, min_toks
+                    )
+                if rep_pen_drafts is not None:
+                    # After the grammar mask, as the min_tokens mask above.
+                    target_logits, bonus_logits = (
+                        self._repetition_penalty.apply_verify_split(
+                            target_logits,
+                            bonus_logits,
+                            self.input_batch,
+                            self.requests,
+                            cur_start_idx,
+                            rep_pen_drafts,
+                        )
                     )
                 for proc in processors:
                     target_logits, bonus_logits, draft_token_ids = proc.prepare_logits(
@@ -5762,6 +5798,7 @@ class TPUModelRunner(GPUModelRunner):
                             state.top_tokens,
                             min_toks,
                             spec_processors,
+                            rep_pen,
                         )
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
@@ -7314,8 +7351,12 @@ class TPUModelRunner(GPUModelRunner):
         if not self._repetition_penalty.supported:
             return
         with self._precompile_timed("repetition_penalty"):
+            # Request buckets, and the row buckets of a verify chunk's logits
+            # and target rows.
+            row_counts = set(self.num_reqs_paddings)
+            row_counts.update(self._verify_logits_paddings())
             for num_rows in _rotate_precompile_sweep(
-                self.num_reqs_paddings, "repetition_penalty"
+                sorted(row_counts), "repetition_penalty"
             ):
                 out = self._repetition_penalty.warmup(self._dummy_logits(num_rows))
                 synchronize_tensors(out)
